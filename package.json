@@ -1,0 +1,21 @@
+{
+  "name": "slam-dank",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 0.0.0.0",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "^4.10.0-release.1",
+    "babel-plugin-react-compiler": "^0.0.0-experimental-de2cfda-20240912",
+    "mathjs": "^9.5.0",
+    "next": "^15.0.0-rc.0",
+    "react": "^19.0.0-rc-206df66e-20240912",
+    "react-dom": "^19.0.0-rc-206df66e-20240912"
+  },
+  "devDependencies": {
+    "typescript": "^5.1.3"
+  }
+}
