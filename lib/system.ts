@@ -7,7 +7,11 @@ import * as math from 'mathjs';
 import { MapPoint } from './map_manager';  // Add this import at the top of the file
 
 import { CeresSolver, ReprojectionError } from './ceres_solver';
-
+import { withMat, drawKeypoints, decomposeEssentialMatrix, logMatrixInfo } from './opencv_utils';
+import { ensureMatrixDimensions, cvMatToMathMatrix, mathMatrixToCvMat } from './math_utils';
+import { ransac } from './ransac';
+import { Mutex } from 'async-mutex';
+import { logger } from './logger';
 
 const SVD_MODIFY_A = 1;
 const SVD_FULL_UV = 4;
@@ -42,6 +46,8 @@ export class System {
   private virtualObjects: VirtualObject[] = [];
   private frameDatabase: any; // Placeholder for a frame database (e.g., DBoW2)
   private ceresSolver: CeresSolver;
+  private frameMutex: Mutex;
+  private keyframeMutex: Mutex;
 
   constructor() {
     this.imuHandler = new IMUHandler();
@@ -52,6 +58,8 @@ export class System {
     this.matcher = new cv.BFMatcher(cv.NORM_HAMMING, true);
     this.frameDatabase = {}; // Initialize frame database
     this.ceresSolver = new CeresSolver();
+    this.frameMutex = new Mutex();
+    this.keyframeMutex = new Mutex();
   }
 
   public getCurrentFrame(): Frame | null {
@@ -69,17 +77,22 @@ export class System {
     return this.mapManager.getVirtualObjects();
   }
 
-  public trackMonocular(srcMat: cv.Mat, timestamp: number): void {
-    if (!this.isTracking) return;
-    this.previousFrame = this.currentFrame;
-    
-    this.currentFrame = new Frame(timestamp, srcMat, this.orbDetector);
-    const features = this.extractFeatures(srcMat);
-    this.currentFrame.setFeatures(features);
-    
-    this.performSLAM(features);
+  public async trackMonocular(srcMat: cv.Mat, timestamp: number): Promise<void> {
+    await this.frameMutex.runExclusive(async () => {
+      if (!this.isTracking) return;
+      this.previousFrame = this.currentFrame;
+      
+      this.currentFrame = new Frame(timestamp, srcMat, this.orbDetector);
+      const features = this.extractFeatures(srcMat);
+      this.currentFrame.setFeatures(features);
+      
+      await this.performSLAM(features);
 
-    console.log('Frame update:', timestamp, this.currentFrame.getPose());
+      logger.info('Frame update:', timestamp, this.currentFrame.getPose());
+      if (await this.isNewKeyframe()) {
+        await this.addKeyframe(this.currentFrame);
+      }
+    });
   }
 
   public trackMonocularIMU(srcMat: cv.Mat, imuData: IMUData, timestamp: number): void {
@@ -97,7 +110,7 @@ export class System {
 
     this.performSLAM(features);
 
-    console.log('Frame update:', timestamp, this.currentFrame.getPose());
+    logger.info('Frame update:', timestamp, this.currentFrame.getPose());
   }
 
   private extractFeatures(image: cv.Mat): { keypoints: cv.KeyPointVector, descriptors: cv.Mat } {
@@ -107,80 +120,117 @@ export class System {
     return { keypoints, descriptors };
   }
 
-  private performSLAM(features: { keypoints: cv.KeyPointVector, descriptors: cv.Mat }): void {
-    if (this.previousFrame) {
-      const matches = this.matchFeatures(features, this.previousFrame.getFeatures());
-      this.estimatePose(matches, features.keypoints, this.previousFrame.getFeatures().keypoints);
-      this.updateLocalMap(features);
-      this.detectLoopClosure();
-      this.globalOptimization();
-      this.mapManager.updateMap(this.currentFrame);
-    }
+  private async performSLAM(features: { keypoints: cv.KeyPointVector, descriptors: cv.Mat }): Promise<void> {
+    try {
+      if (this.previousFrame) {
+        const matches = this.matchFeatures(features, this.previousFrame.getFeatures());
+        this.estimatePose(matches, features.keypoints, this.previousFrame.getFeatures().keypoints);
+        this.updateLocalMap(features);
+        this.detectLoopClosure();
+        this.globalOptimization();
+        this.mapManager.updateMap(this.currentFrame);
+      }
 
-    this.currentFrame.setFeatures(features);
+      this.currentFrame.setFeatures(features);
 
-    if (this.isNewKeyframe()) {
-      this.keyframes.push(this.currentFrame);
-      this.frameDatabase.add(this.currentFrame, this.computeBoW(this.currentFrame));
+      if (await this.isNewKeyframe()) {
+        await this.addKeyframe(this.currentFrame);
+      }
+    } catch (error) {
+      logger.error('Error in performSLAM:', error);
+      throw error;
     }
   }
 
-  private isNewKeyframe(): boolean {
-    return this.keyframes.length === 0 || 
-           this.currentFrame.getId() - this.keyframes[this.keyframes.length - 1].getId() > 20;
+  private async isNewKeyframe(): Promise<boolean> {
+    return await this.keyframeMutex.runExclusive(() => {
+      return this.keyframes.length === 0 || 
+             this.currentFrame.getId() - this.keyframes[this.keyframes.length - 1].getId() > 20;
+    });
+  }
+
+  private async addKeyframe(frame: Frame): Promise<void> {
+    await this.keyframeMutex.runExclusive(() => {
+      this.keyframes.push(frame);
+      this.frameDatabase.add(frame, this.computeBoW(frame));
+    });
   }
 
   private matchFeatures(features1: { keypoints: cv.KeyPointVector, descriptors: cv.Mat }, 
                         features2: { keypoints: cv.KeyPointVector, descriptors: cv.Mat }): cv.DMatchVector {
     const matches = new cv.DMatchVector();
     this.matcher.match(features1.descriptors, features2.descriptors, matches);
-    return this.filterMatches(matches);
+    return this.filterMatchesWithRANSAC(matches, features1.keypoints, features2.keypoints);
   }
 
-  private filterMatches(matches: cv.DMatchVector): cv.DMatchVector {
-    const filteredMatches = new cv.DMatchVector();
-    const maxDistance = 64; // Adjust this threshold as needed
-
-    for (let i = 0; i < matches.size(); i++) {
-      const match = matches.get(i);
-      if (match.distance < maxDistance) {
-        filteredMatches.push_back(match);
-      }
-    }
-
-    return filteredMatches;
-  }
-
-  private estimatePose(matches: cv.DMatchVector, keypoints1: cv.KeyPointVector, keypoints2: cv.KeyPointVector): void {
-    if (matches.size() < 8) {
-      console.warn('Not enough matches for pose estimation');
-      return;
-    }
-
+  private filterMatchesWithRANSAC(matches: cv.DMatchVector, keypoints1: cv.KeyPointVector, keypoints2: cv.KeyPointVector): cv.DMatchVector {
     const points1 = [];
     const points2 = [];
-
     for (let i = 0; i < matches.size(); i++) {
       const match = matches.get(i);
       points1.push(keypoints1.get(match.queryIdx).pt);
       points2.push(keypoints2.get(match.trainIdx).pt);
     }
 
-    const points1Mat = cv.matFromArray(points1.length, 2, cv.CV_64F, points1.flat());
-    const points2Mat = cv.matFromArray(points2.length, 2, cv.CV_64F, points2.flat());
+    const { inliers } = ransac(points1, points2, this.estimateFundamentalMatrix, 8, 1.0, 0.99, 1000);
 
-    const E = cv.findEssentialMat(points1Mat, points2Mat, this.currentFrame.getCameraMatrix());
-    const [R1, R2, t, negT] = this.decomposeEssentialMatrix(E);
-    const [bestR, bestT] = this.chooseBestPose(R1, R2, t, points1Mat, points2Mat, this.currentFrame.getCameraMatrix());
+    const filteredMatches = new cv.DMatchVector();
+    for (let i = 0; i < inliers.length; i++) {
+      if (inliers[i]) {
+        filteredMatches.push_back(matches.get(i));
+      }
+    }
 
-    this.currentFrame.updatePose(bestR, bestT);
-
-    points1Mat.delete();
-    points2Mat.delete();
-    E.delete();
+    return filteredMatches;
   }
 
-  private decomposeEssentialMatrix(E: cv.Mat): [cv.Mat, cv.Mat, cv.Mat, cv.Mat] {
+  private estimateFundamentalMatrix(points1: cv.Point2[], points2: cv.Point2[]): cv.Mat {
+    const points1Mat = cv.matFromArray(points1.length, 2, cv.CV_64F, points1.flatMap(p => [p.x, p.y]));
+    const points2Mat = cv.matFromArray(points2.length, 2, cv.CV_64F, points2.flatMap(p => [p.x, p.y]));
+    const F = cv.findFundamentalMat(points1Mat, points2Mat, cv.FM_8POINT);
+    points1Mat.delete();
+    points2Mat.delete();
+    return F;
+  }
+
+  private estimatePose(matches: cv.DMatchVector, keypoints1: cv.KeyPointVector, keypoints2: cv.KeyPointVector): void {
+    if (matches.size() < 8) {
+      logger.warn('Not enough matches for pose estimation');
+      return;
+    }
+
+    withMat(
+      () => cv.matFromArray(matches.size(), 2, cv.CV_64F, this.extractMatchPoints(matches, keypoints1)),
+      (points1Mat) => {
+        withMat(
+          () => cv.matFromArray(matches.size(), 2, cv.CV_64F, this.extractMatchPoints(matches, keypoints2)),
+          (points2Mat) => {
+            withMat(
+              () => cv.findEssentialMat(points1Mat, points2Mat, this.currentFrame.getCameraMatrix()),
+              (E) => {
+                logMatrixInfo(E, 'Essential Matrix');
+                const [R1, R2, t] = decomposeEssentialMatrix(E, this.currentFrame.getCameraMatrix());
+                const [bestR, bestT] = this.chooseBestPose(R1, R2, t, points1Mat, points2Mat);
+                this.currentFrame.updatePose(bestR, bestT);
+              }
+            );
+          }
+        );
+      }
+    );
+  }
+
+  private extractMatchPoints(matches: cv.DMatchVector, keypoints: cv.KeyPointVector): number[] {
+    const points = [];
+    for (let i = 0; i < matches.size(); i++) {
+      const match = matches.get(i);
+      const point = keypoints.get(match.queryIdx).pt;
+      points.push(point.x, point.y);
+    }
+    return points;
+  }
+
+  private decomposeEssentialMatrix(E: cv.Mat, K: cv.Mat): [cv.Mat, cv.Mat, cv.Mat] {
     const w = new cv.Mat();
     const u = new cv.Mat();
     const vt = new cv.Mat();
@@ -214,7 +264,7 @@ export class System {
     return [R1, R2, t, negT];
   }
 
-  private chooseBestPose(R1: cv.Mat, R2: cv.Mat, t: cv.Mat, points1: cv.Mat, points2: cv.Mat, K: cv.Mat): [cv.Mat, cv.Mat] {
+  private chooseBestPose(R1: cv.Mat, R2: cv.Mat, t: cv.Mat, points1: cv.Mat, points2: cv.Mat): [cv.Mat, cv.Mat] {
     const poses = [
       { R: R1, t: t },
       { R: R1, t: (() => { const temp = new cv.Mat(); cv.subtract(cv.Mat.zeros(3, 1, cv.CV_64F), t, temp); return temp; })() },
@@ -308,7 +358,7 @@ export class System {
   }
 
   private localBundleAdjustment(): void {
-    console.log('Performing local bundle adjustment');
+    logger.info('Performing local bundle adjustment');
 
     for (const mapPoint of this.mapPoints) {
       for (const observationFrame of mapPoint.observedFrom) {
@@ -363,7 +413,7 @@ export class System {
   }
 
   private detectLoopClosure(): void {
-    console.log('Detecting loop closure');
+    logger.info('Detecting loop closure');
     
     const currentBoW = this.computeBoW(this.currentFrame);
     const candidateFrames = this.frameDatabase.querySimilar(currentBoW);
@@ -375,7 +425,7 @@ export class System {
         const [R, t] = this.estimateTransform(matches);
         
         if (this.isValidTransform(R, t)) {
-          console.log('Loop closure detected!');
+          logger.info('Loop closure detected!');
           this.performLoopClosure(candidateFrame, R, t);
           break;
         }
@@ -415,7 +465,7 @@ export class System {
     const points2Mat = cv.matFromArray(points2.length, 2, cv.CV_64F, points2.flat());
 
     const E = cv.findEssentialMat(points1Mat, points2Mat, this.currentFrame.getCameraMatrix());
-    const [R, t] = this.decomposeEssentialMatrix(E);
+    const [R, t] = this.decomposeEssentialMatrix(E, this.currentFrame.getCameraMatrix());
 
     points1Mat.delete();
     points2Mat.delete();
@@ -436,7 +486,7 @@ export class System {
   }
 
   private performLoopClosure(candidateFrame: Frame, R: cv.Mat, t: cv.Mat): void {
-    console.log('Performing loop closure');
+    logger.info('Performing loop closure');
     
     const loopClosureTransform = new cv.Mat(4, 4, cv.CV_64F);
     R.copyTo(loopClosureTransform.rowRange(0, 3).colRange(0, 3));
@@ -455,7 +505,7 @@ export class System {
   }
 
   private globalOptimization(): void {
-    console.log('Performing global optimization');
+    logger.info('Performing global optimization');
     
     const poseGraph = this.constructPoseGraph();
     this.addLoopClosureConstraints(poseGraph);
@@ -505,7 +555,7 @@ export class System {
   }
 
   private optimizePoseGraph(poseGraph: PoseGraph): math.Matrix[] {
-    console.log('Optimizing pose graph');
+    logger.info('Optimizing pose graph');
     return poseGraph.nodes.map(node => node.pose);
   }
 
@@ -525,6 +575,7 @@ export class System {
       const observations = mapPoint.observedFrom;
       if (observations.length > 0) {
         const newPosition = this.triangulateMapPoint(mapPoint, observations);
+        ensureMatrixDimensions(newPosition, 3, 1);
         mapPoint.position = newPosition;
       }
     }
