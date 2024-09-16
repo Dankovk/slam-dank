@@ -86,7 +86,7 @@ export class System {
       const features = this.extractFeatures(srcMat);
       this.currentFrame.setFeatures(features);
       
-      await this.performSLAM(features);
+      this.performSLAM(features);
 
       logger.info('Frame update:', timestamp, this.currentFrame.getPose());
       if (await this.isNewKeyframe()) {
@@ -120,7 +120,7 @@ export class System {
     return { keypoints, descriptors };
   }
 
-  private async performSLAM(features: { keypoints: cv.KeyPointVector, descriptors: cv.Mat }): Promise<void> {
+  private performSLAM(features: { keypoints: cv.KeyPointVector, descriptors: cv.Mat }): void {
     try {
       if (this.previousFrame) {
         const matches = this.matchFeatures(features, this.previousFrame.getFeatures());
@@ -133,8 +133,8 @@ export class System {
 
       this.currentFrame.setFeatures(features);
 
-      if (await this.isNewKeyframe()) {
-        await this.addKeyframe(this.currentFrame);
+      if (this.isNewKeyframe()) {
+        this.addKeyframe(this.currentFrame);
       }
     } catch (error) {
       logger.error('Error in performSLAM:', error);

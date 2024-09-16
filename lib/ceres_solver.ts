@@ -109,8 +109,13 @@ export class ReprojectionError {
     const transformedPoint = math.add(math.multiply(R, point3D), t) as math.Matrix;
     const projectedPoint = math.multiply(this.K, transformedPoint) as math.Matrix;
     
-    const x = projectedPoint.get([0]) / projectedPoint.get([2]);
-    const y = projectedPoint.get([1]) / projectedPoint.get([2]);
+    const z = projectedPoint.get([2]);
+    if (Math.abs(z) < 1e-10) {
+      throw new Error('Division by zero in point projection');
+    }
+    
+    const x = projectedPoint.get([0]) / z;
+    const y = projectedPoint.get([1]) / z;
     
     return [x, y];
   }

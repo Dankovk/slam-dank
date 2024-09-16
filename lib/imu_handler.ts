@@ -28,10 +28,26 @@ export class IMUHandler {
     const dt = imuData.timestamp - this.lastTimestamp;
     this.lastTimestamp = imuData.timestamp;
 
+    // Basic error checking
+    if (dt <= 0 || dt > 1) {
+      logger.warn('Invalid time delta in IMU data:', dt);
+      return;
+    }
+
+    if (math.norm(imuData.acceleration as math.MathArray) > 100) {
+      logger.warn('Unusually high acceleration detected:', imuData.acceleration);
+      return;
+    }
+
+    if (math.norm(imuData.gyroscope as math.MathArray) > 10) {
+      logger.warn('Unusually high angular velocity detected:', imuData.gyroscope);
+      return;
+    }
+
     // Integrate IMU data
     this.integrateIMUData(imuData, dt);
 
-    console.log('IMU data processed:', {
+    logger.debug('IMU data processed:', {
       acceleration: imuData.acceleration.toString(),
       gyroscope: imuData.gyroscope.toString(),
       timestamp: imuData.timestamp

@@ -11,6 +11,8 @@ export class MapManager {
   private virtualObjects: VirtualObject[];
   private mapPoints: MapPoint[];
   private maxMapPoints: number;
+  private lastCleanupTime: number = 0;
+  private readonly CLEANUP_INTERVAL: number = 60000; // 1 minute
 
   constructor(maxMapPoints: number = 1000) {
     this.virtualObjects = [];
@@ -45,6 +47,7 @@ export class MapManager {
     }
 
     this.pruneMapPoints();
+    this.removeOldMapPoints(frame.getId());
     console.log('Map updated with new frame');
   }
 
@@ -83,6 +86,17 @@ export class MapManager {
       this.mapPoints.sort((a, b) => b.observations - a.observations);
       // Keep only the top maxMapPoints
       this.mapPoints = this.mapPoints.slice(0, this.maxMapPoints);
+    }
+  }
+
+  private removeOldMapPoints(currentFrameId: number): void {
+    const currentTime = Date.now();
+    if (currentTime - this.lastCleanupTime > this.CLEANUP_INTERVAL) {
+      this.mapPoints = this.mapPoints.filter(point => {
+        const lastObservationAge = currentFrameId - Math.max(...point.observedFrom.map(f => f.getId()));
+        return lastObservationAge < 100; // Remove points not seen in last 100 frames
+      });
+      this.lastCleanupTime = currentTime;
     }
   }
 }

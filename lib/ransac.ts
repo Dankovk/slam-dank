@@ -11,6 +11,10 @@ export function ransac(
   confidence: number, 
   maxIterations: number
 ) {
+  if (points1.length < minSamples || points2.length < minSamples) {
+    throw new Error(`Not enough points for RANSAC. Required: ${minSamples}, Got: ${points1.length}`);
+  }
+
   let bestInliers: boolean[] = [];
   let bestModel: cv.Mat | null = null;
 

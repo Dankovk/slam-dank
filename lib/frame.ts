@@ -87,6 +87,9 @@ export class Frame {
       this.features.descriptors.delete();
     }
     this.cameraMatrix.delete();
+    if (this.image) {
+      this.image.delete();
+    }
   }
 
   private getCameraIntrinsics(): { fx: number, fy: number, cx: number, cy: number } {
